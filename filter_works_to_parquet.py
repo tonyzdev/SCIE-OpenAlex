@@ -17,7 +17,7 @@ src = s3fs.S3FileSystem(anon=True)    # 公共桶读
 dst = s3fs.S3FileSystem()              # 你自己的桶写（走实例角色）
 
 BUCKET = "bucket-openalex"
-PREFIX = "openalex/filtered_parquet"
+PREFIX = "openalex/filtered_parquet_full"
 ONE_UD = os.environ.get("TEST_UD")     # 若设置，只处理这个 updated_date=YYYY-MM-DD
 
 if not BUCKET:
@@ -49,31 +49,32 @@ current_ud = None
 buf = []
 
 for p in paths:
-    ud = next((seg.split("=")[1] for seg in p.split("/") if seg.startswith("updated_date=")), "unknown")
-    if current_ud is None: current_ud = ud
+    # 提取 updated_date
+    parts = p.split("/")
+    ud = next((seg.split("=")[1] for seg in parts if seg.startswith("updated_date=")), "unknown")
+
+    if current_ud is None:
+        current_ud = ud
     elif ud != current_ud:
         write_batch(buf, current_ud)
         current_ud = ud
 
+    # 读取 gzip JSONL
     with src.open(p, "rb") as fin, gzip.open(fin, "rt", encoding="utf-8", errors="ignore") as gz:
         for line in gz:
             try:
                 w = json.loads(line)
             except:
                 continue
-            if any(sid in allow for sid in source_ids_of_work(w)):
-                buf.append({
-                    "id": w.get("id"),
-                    "doi": w.get("doi"),
-                    "title": w.get("title"),
-                    "publication_year": w.get("publication_year"),
-                    "publication_date": w.get("publication_date"),
-                    "is_corr_author": any(a.get("is_corresponding") for a in (w.get("authorships") or [])),
-                    "journal_id": ((w.get("primary_location") or {}).get("source") or {}).get("id"),
-                    "cited_by_count": w.get("cited_by_count"),
-                })
+
+            # 命中判断：primary_location 或 locations 里的 source.id
+            if any(s in allow for s in source_ids_of_work(w)):
+                # 关键：整条原始 JSON 直接写入 parquet
+                buf.append(w)
+
                 if len(buf) >= BATCH:
                     write_batch(buf, ud)
 
+# flush 最后一批
 write_batch(buf, current_ud)
 print("DONE")

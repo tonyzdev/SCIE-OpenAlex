@@ -13,7 +13,7 @@ BUCKET = "bucket-openalex"
 PREFIX = "openalex/filtered_parquet_full"
 ONE_UD = os.environ.get("TEST_UD")  # 若设置，只处理这个 updated_date=YYYY-MM-DD
 BATCH = 20000                      # 每个 parquet 里最多多少条记录
-WORKERS = 4                        # 多进程 worker 数（m7i.4xlarge 建议 4~6）
+WORKERS = 6                     # 多进程 worker 数（m7i.4xlarge 建议 4~6）
 
 
 # ========== 读白名单 ==========

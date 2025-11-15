@@ -69,6 +69,7 @@ for p in paths:
                     "publication_year": w.get("publication_year"),
                     "publication_date": w.get("publication_date"),
                     "type": w.get("type"),
+                    "abstract_inverted_index": w.get("abstract_inverted_index"),
                     "is_corr_author": any(a.get("is_corresponding") for a in (w.get("authorships") or [])),
                     "journal_id": ((w.get("primary_location") or {}).get("source") or {}).get("id"),
                     "cited_by_count": w.get("cited_by_count"),

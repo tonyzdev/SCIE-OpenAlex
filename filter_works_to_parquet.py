@@ -4,6 +4,7 @@ import json
 import gzip
 import io
 import time
+import multiprocessing
 from multiprocessing import Pool
 
 import boto3
@@ -15,13 +16,13 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 # ========== 配置 ==========
-# 目标桶：你的私有桶，用来写过滤后的 parquet
-BUCKET = "bucket-openalex"
+BUCKET = "bucket-openalex"  # 你自己的桶，用来写过滤结果
 PREFIX = "openalex/filtered_parquet_full"
 ONE_UD = os.environ.get("TEST_UD")  # 若设置，只处理这个 updated_date=YYYY-MM-DD
 
-BATCH = 16000          # 每个 parquet 里最多多少条记录
-WORKERS = 5            # 多进程 worker 数
+# 保守一点：先降低 batch 和并发，确保不再把机器干死
+BATCH = 8000            # 每个 parquet 里最多记录数
+WORKERS = 3             # 多进程 worker 数
 
 PUBLIC_BUCKET = "openalex"   # OpenAlex 公共桶名称
 
@@ -39,7 +40,7 @@ def load_allow():
     return allow
 
 
-ALLOW = load_allow()  # 全局，用于 worker
+ALLOW = load_allow()
 
 
 # ========== 工具函数 ==========
@@ -66,15 +67,16 @@ def extract_updated_date_from_path(p: str) -> str:
 # ========== worker：处理一个 .gz ==========
 def process_one_gz(key: str):
     """
-    单个分片处理（稳定版）：
-    - 读：使用匿名的 boto3 client 从 openalex 公共桶流式读取 gzip
-    - 写：使用带权限的 boto3 client 写到你自己的桶 BUCKET
-    - 3 次重试，异常不会把主进程搞挂
+    单个分片处理（极度保守 + 稳定版）：
+    - 读：匿名 boto3 从 openalex 公共桶流式读取 gzip
+    - 写：带权限的 boto3 写入你的 BUCKET
+    - 严格关闭 Body / 释放对象
+    - 3 次重试
     """
     ud = extract_updated_date_from_path(key)
     buf = []
 
-    # 每个 worker 自己的 client：读用匿名，写用默认
+    # 每个 worker 自己的 client：读用匿名，写用默认角色
     s3_read = boto3.client("s3", config=Config(signature_version=UNSIGNED))
     s3_write = boto3.client("s3")
 
@@ -83,7 +85,6 @@ def process_one_gz(key: str):
             return
         table = pa.Table.from_pylist(buf)
 
-        # 写到内存 buffer，再 put_object
         out_buf = io.BytesIO()
         pq.write_table(table, out_buf, compression="snappy")
         out_buf.seek(0)
@@ -96,25 +97,29 @@ def process_one_gz(key: str):
         )
         buf.clear()
 
+        # 明确释放大对象
+        del table
+        del out_buf
+
     for attempt in range(3):
         try:
             # 匿名读公共桶
             resp = s3_read.get_object(Bucket=PUBLIC_BUCKET, Key=key)
-            body = resp["Body"]
+            # 确保 Body 被正确关闭
+            with resp["Body"] as body:
+                # gzip 流式读取
+                with gzip.GzipFile(fileobj=body, mode="rb") as gz:
+                    for raw in gz:
+                        try:
+                            line = raw.decode("utf-8", errors="ignore")
+                            w = json.loads(line)
+                        except Exception:
+                            continue
 
-            # gzip 流式读取
-            with gzip.GzipFile(fileobj=body, mode="rb") as gz:
-                for raw in gz:
-                    try:
-                        line = raw.decode("utf-8", errors="ignore")
-                        w = json.loads(line)
-                    except Exception:
-                        continue
-
-                    if any(s in ALLOW for s in source_ids_of_work(w)):
-                        buf.append(w)
-                        if len(buf) >= BATCH:
-                            flush()
+                        if any(s in ALLOW for s in source_ids_of_work(w)):
+                            buf.append(w)
+                            if len(buf) >= BATCH:
+                                flush()
 
             flush()
             return key  # 成功处理
@@ -137,16 +142,15 @@ def process_one_gz(key: str):
 
 # ========== 主程序 ==========
 def main():
-    # 主进程：用匿名客户端列出 openalex 公共桶的所有 works 分片
     print("正在列出 openalex/data/works/ ...")
 
+    # 主进程：匿名列出公共桶
     s3_public = boto3.client("s3", config=Config(signature_version=UNSIGNED))
     paginator = s3_public.get_paginator("list_objects_v2")
 
     if ONE_UD:
         prefix = f"data/works/{ONE_UD}/"
     else:
-        # openalex 的公开路径一般是 data/works/updated_date=YYYY-MM-DD/...
         prefix = "data/works/updated_date="
 
     keys = []
@@ -170,4 +174,6 @@ def main():
 
 
 if __name__ == "__main__":
+    # 避免 fork + 线程库的奇怪问题，使用 spawn
+    multiprocessing.set_start_method("spawn")
     main()

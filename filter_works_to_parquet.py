@@ -4,6 +4,7 @@ import json
 import gzip
 import io
 import time
+import random
 import multiprocessing
 from multiprocessing import Pool
 
@@ -20,9 +21,8 @@ BUCKET = "bucket-openalex"  # 你自己的桶，用来写过滤结果
 PREFIX = "openalex/filtered_parquet_full"
 ONE_UD = os.environ.get("TEST_UD")  # 若设置，只处理这个 updated_date=YYYY-MM-DD
 
-# 保守一点：先降低 batch 和并发，确保不再把机器干死
-BATCH = 8000            # 每个 parquet 里最多记录数
-WORKERS = 3             # 多进程 worker 数
+BATCH = 8000            # 每个 parquet 里最多记录数（先保守一点）
+WORKERS = 3             # 多进程 worker 数（先保守一点）
 
 PUBLIC_BUCKET = "openalex"   # OpenAlex 公共桶名称
 
@@ -65,14 +65,11 @@ def extract_updated_date_from_path(p: str) -> str:
 
 
 # ========== worker：处理一个 .gz ==========
-def process_one_gz(key: str):
+def process_one_gz(task):
     """
-    单个分片处理（极度保守 + 稳定版）：
-    - 读：匿名 boto3 从 openalex 公共桶流式读取 gzip
-    - 写：带权限的 boto3 写入你的 BUCKET
-    - 严格关闭 Body / 释放对象
-    - 3 次重试
+    task: (global_index, key)
     """
+    idx, key = task
     ud = extract_updated_date_from_path(key)
     buf = []
 
@@ -97,17 +94,17 @@ def process_one_gz(key: str):
         )
         buf.clear()
 
-        # 明确释放大对象
         del table
         del out_buf
 
     for attempt in range(3):
         try:
-            # 匿名读公共桶
+            # 这里标记一下开始处理哪个分片，方便之后排查
+            if attempt == 0:
+                print(f"[INFO] 开始处理分片 #{idx}: {key}")
+
             resp = s3_read.get_object(Bucket=PUBLIC_BUCKET, Key=key)
-            # 确保 Body 被正确关闭
             with resp["Body"] as body:
-                # gzip 流式读取
                 with gzip.GzipFile(fileobj=body, mode="rb") as gz:
                     for raw in gz:
                         try:
@@ -122,29 +119,29 @@ def process_one_gz(key: str):
                                 flush()
 
             flush()
-            return key  # 成功处理
+            print(f"[INFO] 完成分片 #{idx}: {key}")
+            return idx  # 返回 index，方便主进程统计
 
         except botocore.exceptions.ClientError as e:
             code = e.response["Error"].get("Code")
             if code == "NoSuchKey":
                 print(f"[WARN] S3 key 不存在，跳过: {key}")
-                return key
-            print(f"[WARN] boto3 ClientError 处理 {key} 出错 (第 {attempt+1}/3 次): {e}")
+                return idx
+            print(f"[WARN] boto3 ClientError 处理 #{idx} {key} 出错 (第 {attempt+1}/3 次): {e}")
             time.sleep(3 * (attempt + 1))
 
         except Exception as e:
-            print(f"[WARN] 处理 {key} 出错 (第 {attempt+1}/3 次): {repr(e)}")
+            print(f"[WARN] 处理 #{idx} {key} 出错 (第 {attempt+1}/3 次): {repr(e)}")
             time.sleep(3 * (attempt + 1))
 
-    print(f"[WARN] 放弃分片 {key}，连续失败 3 次")
-    return key
+    print(f"[WARN] 放弃分片 #{idx}: {key}，连续失败 3 次")
+    return idx
 
 
 # ========== 主程序 ==========
 def main():
     print("正在列出 openalex/data/works/ ...")
 
-    # 主进程：匿名列出公共桶
     s3_public = boto3.client("s3", config=Config(signature_version=UNSIGNED))
     paginator = s3_public.get_paginator("list_objects_v2")
 
@@ -159,21 +156,31 @@ def main():
             if obj["Key"].endswith(".gz"):
                 keys.append(obj["Key"])
 
-    print(f"共发现 {len(keys)} 个 gzip 分片，使用 {WORKERS} 个进程并行处理")
+    total = len(keys)
+    print(f"共发现 {total} 个 gzip 分片")
 
     if not keys:
         print("没有匹配到任何 .gz 文件，退出。")
         return
 
+    # 🔁 关键：把顺序随机打乱，不再每次都按同样顺序处理
+    random.shuffle(keys)
+
+    # 为了以后排查问题，把 (index, key) 一起传进 worker
+    tasks = list(enumerate(keys))  # idx 从 0 开始
+
+    print(f"使用 {WORKERS} 个进程并行处理（顺序已随机打乱）")
+
+    done = 0
     with Pool(processes=WORKERS) as pool:
-        for i, k in enumerate(pool.imap_unordered(process_one_gz, keys, chunksize=1), 1):
-            if i % 100 == 0 or i == len(keys):
-                print(f"[PROGRESS] 已完成 {i}/{len(keys)} 个分片")
+        for _ in pool.imap_unordered(process_one_gz, tasks, chunksize=1):
+            done += 1
+            if done % 100 == 0 or done == total:
+                print(f"[PROGRESS] 已完成 {done}/{total} 个分片")
 
     print("DONE")
 
 
 if __name__ == "__main__":
-    # 避免 fork + 线程库的奇怪问题，使用 spawn
     multiprocessing.set_start_method("spawn")
     main()

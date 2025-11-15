@@ -2,20 +2,21 @@ import os
 import csv
 import json
 import gzip
-import s3fs
+import boto3
+import botocore
 import pyarrow as pa
 import pyarrow.parquet as pq
-from multiprocessing import Pool, cpu_count
+from multiprocessing import Pool
 import time
 
 # ========== 配置 ==========
-# 目标桶：优先环境变量 MY_BUCKET，没有就用默认
 BUCKET = "bucket-openalex"
 PREFIX = "openalex/filtered_parquet_full"
 ONE_UD = os.environ.get("TEST_UD")  # 若设置，只处理这个 updated_date=YYYY-MM-DD
-BATCH = 16000                      # 每个 parquet 里最多多少条记录
-WORKERS = 5                     # 多进程 worker 数（m7i.4xlarge 建议 4~6）
+BATCH = 16000
+WORKERS = 5
 
+s3 = boto3.client("s3")  # 主进程也需要列 key
 
 # ========== 读白名单 ==========
 def load_allow():
@@ -29,9 +30,7 @@ def load_allow():
         raise SystemExit("journal_id_map.csv 没有有效的 source_id")
     return allow
 
-
-ALLOW = load_allow()  # 全局，用于 worker
-
+ALLOW = load_allow()
 
 # ========== 工具函数 ==========
 def source_ids_of_work(w):
@@ -45,7 +44,6 @@ def source_ids_of_work(w):
             sids.append(so["id"])
     return sids
 
-
 def extract_updated_date_from_path(p: str) -> str:
     parts = p.split("/")
     return next(
@@ -53,92 +51,96 @@ def extract_updated_date_from_path(p: str) -> str:
         "unknown",
     )
 
-
 # ========== worker：处理一个 .gz ==========
 def process_one_gz(p: str):
     """
-    单个分片的健壮处理：
-    - 对 S3 连接问题做 3 次重试（带退避）
-    - 所有异常都在本函数内部吞掉，只打印 WARN，绝不让异常冒到主进程
+    单个分片处理（超稳定版）：
+    - 不使用 s3fs
+    - 用 boto3.get_object 流式读取
+    - gzip streaming
+    - 强韧性 retry（3 次）
     """
     ud = extract_updated_date_from_path(p)
     buf = []
 
-    def flush(dst_fs):
+    s3_worker = boto3.client("s3")  # 每个 worker 自己的客户端，互不影响
+
+    def flush():
         if not buf:
             return
         table = pa.Table.from_pylist(buf)
-        key = (
-            f"s3://{BUCKET}/{PREFIX}/updated_date={ud}/"
-            f"part-{os.urandom(4).hex()}.parquet"
+        key = f"{PREFIX}/updated_date={ud}/part-{os.urandom(4).hex()}.parquet"
+        s3_worker.put_object(
+            Bucket=BUCKET,
+            Key=key,
+            Body=pq.write_table(table, compression="snappy").read()  # in-memory
         )
-        with dst_fs.open(key, "wb") as f:
-            pq.write_table(table, f, compression="snappy")
         buf.clear()
 
-    # 最多重试 3 次
     for attempt in range(3):
         try:
-            src = s3fs.S3FileSystem(anon=True)
-            dst = s3fs.S3FileSystem()
+            # boto3 get_object（最稳定的 S3 streaming 方式）
+            resp = s3_worker.get_object(Bucket="openalex", Key=p)
+            body = resp["Body"]
 
-            with src.open(p, "rb") as fin, gzip.open(
-                fin, "rt", encoding="utf-8", errors="ignore"
-            ) as gz:
-                for line in gz:
-                    try:
-                        w = json.loads(line)
-                    except Exception:
-                        continue
+            # gzip streaming：不会积累 socket，不会占高内存
+            gz = gzip.GzipFile(fileobj=body, mode="rb")
 
-                    if any(s in ALLOW for s in source_ids_of_work(w)):
-                        buf.append(w)
-                        if len(buf) >= BATCH:
-                            flush(dst)
+            for raw in gz:
+                try:
+                    line = raw.decode("utf-8", errors="ignore")
+                    w = json.loads(line)
+                except Exception:
+                    continue
 
-            # 正常读完就 flush 一下
-            flush(dst)
-            return p  # 成功，直接返回
+                if any(s in ALLOW for s in source_ids_of_work(w)):
+                    buf.append(w)
+                    if len(buf) >= BATCH:
+                        flush()
 
-        except FileNotFoundError:
-            print(f"[WARN] S3 key 不存在，跳过: {p}")
-            return p  # 不用重试了，真的没有这个 key
+            flush()
+            return p
+
+        except botocore.exceptions.ClientError as e:
+            # 404 / 403 之类的
+            if e.response["Error"]["Code"] == "NoSuchKey":
+                print(f"[WARN] S3 key 不存在，跳过: {p}")
+                return p
+            print(f"[WARN] boto3 错误: {repr(e)} (第 {attempt+1}/3 次)")
+            time.sleep(3 * (attempt + 1))
 
         except Exception as e:
-            # 其他异常（包含 ConnectionError 等），打印后重试几次
-            print(
-                f"[WARN] 读取 {p} 出错，第 {attempt+1}/3 次尝试: {repr(e)}"
-            )
-            # 如果已经是最后一次尝试，就放弃这个分片
-            if attempt == 2:
-                print(f"[WARN] 放弃分片 {p}，连续失败 3 次")
-                return p
-            # 简单退避一下，避免短时间内疯狂重试
-            time.sleep(5 * (attempt + 1))
+            print(f"[WARN] 处理 {p} 出错: {repr(e)} (第 {attempt+1}/3 次)")
+            time.sleep(3 * (attempt + 1))
 
-    # 理论上不会跑到这里
+    print(f"[WARN] 放弃分片 {p}，连续失败 3 次")
     return p
 
 
 # ========== 主程序 ==========
 def main():
-    # 先在主进程里列出所有路径
-    src = s3fs.S3FileSystem(anon=True)
+    # 列出 openalex bucket 的全部 works 分片
+    print("正在列出 openalex/data/works/...")
+    paginator = s3.get_paginator("list_objects_v2")
 
-    pattern = (
-        f"openalex/data/works/{ONE_UD}/*.gz"
+    prefix = (
+        f"openalex/data/works/{ONE_UD}/"
         if ONE_UD
-        else "openalex/data/works/updated_date=*/**/*.gz"
+        else "openalex/data/works/updated_date="
     )
-    paths = list(src.glob(pattern))
-    print(f"共发现 {len(paths)} 个 gzip 分片，使用 {WORKERS} 个进程并行处理")
+
+    paths = []
+    for page in paginator.paginate(Bucket="openalex", Prefix=prefix):
+        for obj in page.get("Contents", []):
+            if obj["Key"].endswith(".gz"):
+                paths.append(obj["Key"])
+
+    print(f"共发现 {len(paths)} 个 gzip 分片，使用 {WORKERS} 个并行进程")
 
     if not paths:
         print("没有匹配到任何 .gz 文件，退出。")
         return
 
-    # 多进程：每个 worker 处理一部分 paths
-    # chunksize=1 保守一点，不追求极限吞吐
     with Pool(processes=WORKERS) as pool:
         for i, p in enumerate(pool.imap_unordered(process_one_gz, paths, chunksize=1), 1):
             if i % 100 == 0 or i == len(paths):

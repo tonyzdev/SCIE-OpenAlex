@@ -6,6 +6,7 @@ import s3fs
 import pyarrow as pa
 import pyarrow.parquet as pq
 from multiprocessing import Pool, cpu_count
+import time
 
 # ========== 配置 ==========
 # 目标桶：优先环境变量 MY_BUCKET，没有就用默认
@@ -56,18 +57,14 @@ def extract_updated_date_from_path(p: str) -> str:
 # ========== worker：处理一个 .gz ==========
 def process_one_gz(p: str):
     """
-    单个进程处理一个 .gz 文件：
-    - 从公共 openalex 桶读
-    - 过滤命中的 works
-    - 按 BATCH 大小写到自己 S3 桶对应 updated_date 分区下
+    单个分片的健壮处理：
+    - 对 S3 连接问题做 3 次重试（带退避）
+    - 所有异常都在本函数内部吞掉，只打印 WARN，绝不让异常冒到主进程
     """
-    src = s3fs.S3FileSystem(anon=True)   # 每个进程自己建一套 client，避免跨进程共享
-    dst = s3fs.S3FileSystem()            # 用实例角色写
-
     ud = extract_updated_date_from_path(p)
     buf = []
 
-    def flush():
+    def flush(dst_fs):
         if not buf:
             return
         table = pa.Table.from_pylist(buf)
@@ -75,35 +72,52 @@ def process_one_gz(p: str):
             f"s3://{BUCKET}/{PREFIX}/updated_date={ud}/"
             f"part-{os.urandom(4).hex()}.parquet"
         )
-        with dst.open(key, "wb") as f:
+        with dst_fs.open(key, "wb") as f:
             pq.write_table(table, f, compression="snappy")
         buf.clear()
 
-    try:
-        with src.open(p, "rb") as fin, gzip.open(
-            fin, "rt", encoding="utf-8", errors="ignore"
-        ) as gz:
-            for line in gz:
-                try:
-                    w = json.loads(line)
-                except Exception:
-                    # 单行坏掉就丢掉
-                    continue
+    # 最多重试 3 次
+    for attempt in range(3):
+        try:
+            src = s3fs.S3FileSystem(anon=True)
+            dst = s3fs.S3FileSystem()
 
-                if any(s in ALLOW for s in source_ids_of_work(w)):
-                    buf.append(w)
-                    if len(buf) >= BATCH:
-                        flush()
+            with src.open(p, "rb") as fin, gzip.open(
+                fin, "rt", encoding="utf-8", errors="ignore"
+            ) as gz:
+                for line in gz:
+                    try:
+                        w = json.loads(line)
+                    except Exception:
+                        continue
 
-    except FileNotFoundError:
-        # 对应之前的 NoSuchKey：列到 key 了，但读的时候发现没了
-        print(f"[WARN] S3 key 不存在，跳过: {p}")
-    except Exception as e:
-        print(f"[WARN] 处理 {p} 出错: {e}")
+                    if any(s in ALLOW for s in source_ids_of_work(w)):
+                        buf.append(w)
+                        if len(buf) >= BATCH:
+                            flush(dst)
 
-    # 最后一批
-    flush()
-    return p  # 返回一下方便调试 / 打日志
+            # 正常读完就 flush 一下
+            flush(dst)
+            return p  # 成功，直接返回
+
+        except FileNotFoundError:
+            print(f"[WARN] S3 key 不存在，跳过: {p}")
+            return p  # 不用重试了，真的没有这个 key
+
+        except Exception as e:
+            # 其他异常（包含 ConnectionError 等），打印后重试几次
+            print(
+                f"[WARN] 读取 {p} 出错，第 {attempt+1}/3 次尝试: {repr(e)}"
+            )
+            # 如果已经是最后一次尝试，就放弃这个分片
+            if attempt == 2:
+                print(f"[WARN] 放弃分片 {p}，连续失败 3 次")
+                return p
+            # 简单退避一下，避免短时间内疯狂重试
+            time.sleep(5 * (attempt + 1))
+
+    # 理论上不会跑到这里
+    return p
 
 
 # ========== 主程序 ==========

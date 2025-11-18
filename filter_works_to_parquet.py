@@ -60,9 +60,18 @@ def source_ids_of_work(w):
 def write_batch(batch, updated_date):
     if not batch: return
     try:
-        logger.info(f"[准备写入] {len(batch)} 条记录")
+        batch_size = len(batch)
+        logger.info(f"[准备写入] {batch_size} 条记录")
+        
+        # 尝试构建Table，这一步可能很慢或卡住
+        logger.info(f"[开始构建Table]")
+        import sys
+        sys.stdout.flush()  # 强制刷新输出
+        
         table = pa.Table.from_pylist(batch)
-        logger.info(f"[已构建Table] 内存大小约 {table.nbytes / 1024 / 1024:.2f} MB")
+        
+        table_size_mb = table.nbytes / 1024 / 1024
+        logger.info(f"[已构建Table] 内存大小约 {table_size_mb:.2f} MB")
         
         key = f"s3://{BUCKET}/{PREFIX}/updated_date={updated_date}/part-{os.urandom(4).hex()}.parquet"
         logger.info(f"[开始上传] -> {key}")
@@ -70,10 +79,15 @@ def write_batch(batch, updated_date):
         with dst.open(key, "wb") as f:
             pq.write_table(table, f, compression="snappy")
         
-        logger.info(f"[写入成功] {len(batch)} 条记录")
+        logger.info(f"[写入成功] {batch_size} 条记录")
         batch.clear()
+    except MemoryError as e:
+        logger.error(f"[内存错误] 尝试写入 {len(batch)} 条记录时内存不足: {e}")
+        raise
     except Exception as e:
-        logger.error(f"[写入失败] 错误: {e}")
+        logger.error(f"[写入失败] 错误类型: {type(e).__name__}, 详情: {e}")
+        import traceback
+        logger.error(f"[堆栈跟踪] {traceback.format_exc()}")
         raise
 
 # 遍历公开桶 works 分片
@@ -84,7 +98,7 @@ logger.info(f"开始扫描文件，模式: {pattern}")
 paths = list(paths)
 logger.info(f"找到 {len(paths)} 个文件待处理")
 
-BATCH = 8000
+BATCH = 3000  # 减小到3000，避免内存问题
 current_ud = None
 buf = []
 processed_files = 0

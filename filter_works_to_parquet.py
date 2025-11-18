@@ -2,6 +2,7 @@ import s3fs, gzip, json, os
 import pyarrow as pa, pyarrow.parquet as pq
 import csv
 import logging
+import gc
 from datetime import datetime, timezone, timedelta
 
 # 配置日志：强制使用东八区时间
@@ -58,12 +59,22 @@ def source_ids_of_work(w):
 
 def write_batch(batch, updated_date):
     if not batch: return
-    table = pa.Table.from_pylist(batch)
-    key = f"s3://{BUCKET}/{PREFIX}/updated_date={updated_date}/part-{os.urandom(4).hex()}.parquet"
-    with dst.open(key, "wb") as f:
-        pq.write_table(table, f, compression="snappy")
-    logger.info(f"写入批次: {len(batch)} 条记录 -> {key}")
-    batch.clear()
+    try:
+        logger.info(f"[准备写入] {len(batch)} 条记录")
+        table = pa.Table.from_pylist(batch)
+        logger.info(f"[已构建Table] 内存大小约 {table.nbytes / 1024 / 1024:.2f} MB")
+        
+        key = f"s3://{BUCKET}/{PREFIX}/updated_date={updated_date}/part-{os.urandom(4).hex()}.parquet"
+        logger.info(f"[开始上传] -> {key}")
+        
+        with dst.open(key, "wb") as f:
+            pq.write_table(table, f, compression="snappy")
+        
+        logger.info(f"[写入成功] {len(batch)} 条记录")
+        batch.clear()
+    except Exception as e:
+        logger.error(f"[写入失败] 错误: {e}")
+        raise
 
 # 遍历公开桶 works 分片
 pattern = f"openalex/data/works/{ONE_UD}/*.gz" if ONE_UD else "openalex/data/works/updated_date=*/**/*.gz"
@@ -73,7 +84,7 @@ logger.info(f"开始扫描文件，模式: {pattern}")
 paths = list(paths)
 logger.info(f"找到 {len(paths)} 个文件待处理")
 
-BATCH = 20000
+BATCH = 8000
 current_ud = None
 buf = []
 processed_files = 0
@@ -95,43 +106,59 @@ for p in paths:
     line_count = 0
     matched_count = 0
     
-    with src.open(p, "rb") as fin, gzip.open(fin, "rt", encoding="utf-8", errors="ignore") as gz:
-        for line in gz:
-            line_count += 1
-            # 每处理10000行输出一次心跳日志
-            if line_count % 10000 == 0:
-                logger.info(f"  [心跳] 文件 {processed_files}: 已读取 {line_count} 行，匹配 {matched_count} 条")
-            
+    try:
+        with src.open(p, "rb") as fin, gzip.open(fin, "rt", encoding="utf-8", errors="ignore") as gz:
+            for line in gz:
+                line_count += 1
+                # 每处理10000行输出一次心跳日志
+                if line_count % 10000 == 0:
+                    logger.info(f"  [心跳] 文件 {processed_files}: 已读取 {line_count} 行，匹配 {matched_count} 条，缓冲区 {len(buf)} 条")
+                
+                try:
+                    w = json.loads(line)
+                except:
+                    continue
+                if any(sid in allow for sid in source_ids_of_work(w)):
+                    matched_count += 1
+                    buf.append({
+                        "id": w.get("id"),
+                        "doi": w.get("doi"),
+                        "title": w.get("title"),
+                        "publication_year": w.get("publication_year"),
+                        "publication_date": w.get("publication_date"),
+                        "type": w.get("type"),
+                        "abstract_inverted_index": w.get("abstract_inverted_index"),
+                        "is_corr_author": any(a.get("is_corresponding") for a in (w.get("authorships") or [])),
+                        "journal_id": ((w.get("primary_location") or {}).get("source") or {}).get("id"),
+                        "cited_by_count": w.get("cited_by_count"),
+                        "referenced_works_count": w.get("referenced_works_count"),
+                        "open_access": w.get("open_access"),
+                        "authorships": w.get("authorships"),
+                        "primary_location": w.get("primary_location"),
+                        "referenced_works": w.get("referenced_works"),
+                        "topics": w.get("topics"),
+                    })
+                    if len(buf) >= BATCH:
+                        write_batch(buf, ud)
+                        gc.collect()  # 强制垃圾回收
+    except Exception as e:
+        logger.error(f"[文件处理异常] 文件 {p}: {e}")
+        # 如果有未写入的数据，尝试写入
+        if buf:
             try:
-                w = json.loads(line)
+                write_batch(buf, ud)
             except:
-                continue
-            if any(sid in allow for sid in source_ids_of_work(w)):
-                matched_count += 1
-                buf.append({
-                    "id": w.get("id"),
-                    "doi": w.get("doi"),
-                    "title": w.get("title"),
-                    "publication_year": w.get("publication_year"),
-                    "publication_date": w.get("publication_date"),
-                    "type": w.get("type"),
-                    "abstract_inverted_index": w.get("abstract_inverted_index"),
-                    "is_corr_author": any(a.get("is_corresponding") for a in (w.get("authorships") or [])),
-                    "journal_id": ((w.get("primary_location") or {}).get("source") or {}).get("id"),
-                    "cited_by_count": w.get("cited_by_count"),
-                    "referenced_works_count": w.get("referenced_works_count"),
-                    "open_access": w.get("open_access"),
-                    "authorships": w.get("authorships"),
-                    "primary_location": w.get("primary_location"),
-                    "referenced_works": w.get("referenced_works"),
-                    "topics": w.get("topics"),
-                })
-                if len(buf) >= BATCH:
-                    write_batch(buf, ud)
+                pass
+        raise
     
     # 文件处理完成的日志
-    logger.info(f"[完成] 文件 {processed_files}: 共读取 {line_count} 行，匹配 {matched_count} 条")
+    logger.info(f"[完成] 文件 {processed_files}: 共读取 {line_count} 行，匹配 {matched_count} 条，当前缓冲区 {len(buf)} 条")
+    
+    # 每个文件处理完后清理内存
+    gc.collect()
 
+# 写入剩余数据
+logger.info(f"[最终写入] 剩余缓冲区 {len(buf)} 条")
 write_batch(buf, current_ud)
 logger.info(f"处理完成！共处理 {processed_files} 个文件")
 logger.info("DONE")

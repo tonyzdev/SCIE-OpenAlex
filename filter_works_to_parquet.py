@@ -82,19 +82,32 @@ for p in paths:
     processed_files += 1
     if processed_files % 10 == 0:
         logger.info(f"处理进度: {processed_files}/{len(paths)} 文件")
+    
     ud = next((seg.split("=")[1] for seg in p.split("/") if seg.startswith("updated_date=")), "unknown")
     if current_ud is None: current_ud = ud
     elif ud != current_ud:
         write_batch(buf, current_ud)
         current_ud = ud
-
+    
+    # 开始处理文件的心跳日志
+    logger.info(f"[开始] 文件 {processed_files}/{len(paths)}: {p}")
+    
+    line_count = 0
+    matched_count = 0
+    
     with src.open(p, "rb") as fin, gzip.open(fin, "rt", encoding="utf-8", errors="ignore") as gz:
         for line in gz:
+            line_count += 1
+            # 每处理10000行输出一次心跳日志
+            if line_count % 10000 == 0:
+                logger.info(f"  [心跳] 文件 {processed_files}: 已读取 {line_count} 行，匹配 {matched_count} 条")
+            
             try:
                 w = json.loads(line)
             except:
                 continue
             if any(sid in allow for sid in source_ids_of_work(w)):
+                matched_count += 1
                 buf.append({
                     "id": w.get("id"),
                     "doi": w.get("doi"),
@@ -115,6 +128,9 @@ for p in paths:
                 })
                 if len(buf) >= BATCH:
                     write_batch(buf, ud)
+    
+    # 文件处理完成的日志
+    logger.info(f"[完成] 文件 {processed_files}: 共读取 {line_count} 行，匹配 {matched_count} 条")
 
 write_batch(buf, current_ud)
 logger.info(f"处理完成！共处理 {processed_files} 个文件")
